@@ -1,0 +1,16 @@
+services:
+  warp-pool:
+    build: .
+    image: warp-pool:local
+    container_name: warp-pool
+    restart: unless-stopped
+    network_mode: host          # интерфейсы wpoolN должны быть в сети хоста, где их видит xray
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun:/dev/net/tun   # нужен для ENGINE=awg (amneziawg-go создаёт tun)
+    env_file: .env
+    volumes:
+      - ./data:/data            # state.json с ключами аккаунтов — не терять и не светить
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
