@@ -21,6 +21,8 @@
     не рвёт. Для зарубежных VPS.
   - `awg` — AmneziaWG в userspace внутри контейнера (`amneziawg-go`). Мусорные пакеты перед
     handshake, DPI не узнаёт WireGuard. Модуль ядра не нужен. Для хостов в РФ.
+  - `masque` — WARP по протоколу MASQUE (`usque` в контейнере), по умолчанию HTTP/2 поверх
+    TCP/443 с подменённым SNI. Для хостов, где ТСПУ режет любой UDP до Cloudflare (см. ниже).
 - **Автопочинка:** битый аккаунт → новая регистрация; мёртвый эндпоинт → другой, из другой /24.
 - **Эндпоинты `auto`:** адреса подбираются из подсетей WARP, рабочие запоминаются, упавшие
   банятся на 6 ч, порт, на котором легли несколько IP, банится целиком.
@@ -44,7 +46,7 @@
 
 - Linux-хост с Docker и Docker Compose, KVM (не OpenVZ/LXC).
 - `ENGINE=wg`: модуль `wireguard` в ядре хоста.
-- `ENGINE=awg`: `/dev/net/tun`.
+- `ENGINE=awg` / `masque`: `/dev/net/tun`.
 - Xray с поддержкой `sockopt.interface` (3x-ui подходит).
 
 ## Установка
@@ -108,6 +110,34 @@ curl -s -m 5 --interface wpool1 https://www.cloudflare.com/cdn-cgi/trace | grep 
    ```
    Когда `wpool1` поднимется, остальные аккаунты зарегистрируются **через него**.
 
+### Хост в РФ, где не работает и AWG (ENGINE=masque)
+
+Симптом: handshake проходит, первые секунды туннель жив, потом глохнет; новый исходный порт
+снова живёт столько же. Это ТСПУ: UDP-поток до Cloudflare блокируется после **~20 пакетов**
+(не секунд и не байт — при пинге раз в 3 с туннель живёт втрое дольше). Режутся WireGuard,
+AmneziaWG (мусор есть только до handshake, пакеты данных у Cloudflare стандартные) и QUIC.
+Проверить: `docker exec warp-pool awg show` — `latest handshake` старше пары минут и
+`received` не растёт.
+
+TCP до Cloudflare при этом живёт, а MASQUE-соединение с родным SNI
+`consumer-masque.cloudflareclient.com` замораживается после первого ответа. Поэтому `masque`
+по умолчанию ходит HTTP/2 (TCP/443) на `162.159.198.2` с SNI `www.cloudflare.com` — usque
+проверяет сервер по закреплённому ключу, а не по сертификату, так что подмена SNI безопасна.
+
+1. В `.env`: `ENGINE=masque`, `REG_DIRECT=0`.
+2. Засеять первый туннель аккаунтом, зарегистрированным там, где API доступен:
+   ```bash
+   # на зарубежном хосте (образ warp-pool уже содержит usque)
+   docker run --rm -v "$PWD:/w" -w /w --entrypoint usque warp-pool:local register -a
+   # config.json → на РФ-хост в data/, затем:
+   docker compose run --rm warp-pool import 1 /data/config.json
+   docker compose up -d --build
+   ```
+   Остальные туннели зарегистрируются **через него** (регистрация + перевод ключа на MASQUE).
+
+При смене `ENGINE` между `wg`/`awg` и `masque` старые аккаунты не подходят по типу ключа —
+пул сам зарегистрирует новые (через живые туннели или напрямую).
+
 Не держи один ключ одновременно в пуле и в outbound 3x-ui — Cloudflare будет перекидывать
 сессию между ними. Выходной IP WARP геолоцируется по стране клиента, а не по дата-центру
 Cloudflare — с РФ-хоста геоIP будет RU.
@@ -130,7 +160,10 @@ docker compose run --rm warp-pool down                      # снять инт�
 
 | Переменная | По умолч. | |
 |---|---|---|
-| `ENGINE` | `wg` | `wg` — ядерный WireGuard, `awg` — AmneziaWG |
+| `ENGINE` | `wg` | `wg` — ядерный WireGuard, `awg` — AmneziaWG, `masque` — MASQUE (usque) |
+| `MASQUE_HTTP2` | 1 | `masque`: HTTP/2 по TCP; 0 — HTTP/3 по QUIC (UDP) |
+| `MASQUE_SNI` | `www.cloudflare.com` | `masque`: SNI; пусто — родной `consumer-masque.cloudflareclient.com` |
+| `MASQUE_ENDPOINT` / `MASQUE_PORT` | — / 443 | `masque`: адрес сервера; пусто — `162.159.198.2` (h2) или из аккаунта (h3) |
 | `WARP_TUNNELS` | 3 | сколько туннелей |
 | `ENDPOINTS` | `auto` | `auto` или список `ip:port,ip:port,...` |
 | `AUTO_SUBNETS` / `AUTO_PORTS` | подсети WARP / 14 портов | откуда брать адреса в `auto` |

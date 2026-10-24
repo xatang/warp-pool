@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-warp-pool — держит N ядерных WireGuard-туннелей до Cloudflare WARP и сам их чинит.
+warp-pool — держит N туннелей до Cloudflare WARP (WireGuard, AmneziaWG или MASQUE) и сам их чинит.
 
 Каждый туннель — отдельный интерфейс (wpool1..N) со своим WARP-аккаунтом,
 своей таблицей маршрутизации и правилом `ip rule oif <iface>`. Xray использует
@@ -13,7 +13,7 @@ warp-pool — держит N ядерных WireGuard-туннелей до Clou
        и не больше MAX_REG_PER_HOUR на весь хост)
   Если лежат ВСЕ туннели сразу — это сеть хоста, а не WARP: ничего не трогаем.
 
-Команды:  run (по умолчанию) | status | xray | down | import N PRIVKEY V4 [V6]
+Команды:  run (по умолчанию) | status | xray | down | import N PRIVKEY V4 [V6] | import N USQUE_CONFIG.json
 """
 import base64
 import json
@@ -42,13 +42,20 @@ TUNNELS = env_int("WARP_TUNNELS", 3)
 # ENGINE=wg  — ядерный WireGuard хоста (быстро, переживает рестарт контейнера без разрыва)
 # ENGINE=awg — AmneziaWG в userspace (amneziawg-go в контейнере): мусорные пакеты перед handshake,
 #              ТСПУ не узнаёт WireGuard. Для РФ-хостов. Параметры S/H совместимы с Cloudflare.
+# ENGINE=masque — WARP по MASQUE (usque в контейнере). По умолчанию HTTP/2 поверх TCP/443 с подменённым
+#              SNI: там, где ТСПУ режет любой UDP до Cloudflare (WG/AWG/QUIC умирают после ~20 пакетов).
 ENGINE = os.environ.get("ENGINE", "wg").strip().lower()
-if ENGINE not in ("wg", "awg"):
-    sys.exit(f"ENGINE={ENGINE}: допустимо wg или awg")
+if ENGINE not in ("wg", "awg", "masque"):
+    sys.exit(f"ENGINE={ENGINE}: допустимо wg, awg или masque")
+USERSPACE = ENGINE in ("awg", "masque")  # туннель живёт, пока жив процесс в контейнере
 WG_BIN = "awg" if ENGINE == "awg" else "wg"
 AWG_JC = env_int("AWG_JC", 4)
 AWG_JMIN = env_int("AWG_JMIN", 40)
 AWG_JMAX = env_int("AWG_JMAX", 70)
+MASQUE_HTTP2 = env_bool("MASQUE_HTTP2", True)                       # 0 — HTTP/3 (QUIC, UDP)
+MASQUE_SNI = os.environ.get("MASQUE_SNI", "www.cloudflare.com").strip()  # пусто — родной consumer-masque.*
+MASQUE_ENDPOINT = os.environ.get("MASQUE_ENDPOINT", "").strip()     # пусто — 162.159.198.2 (h2) / из аккаунта (h3)
+MASQUE_PORT = env_int("MASQUE_PORT", 443)
 # Регистрация аккаунтов: напрямую, через HTTP-прокси и/или через уже живой туннель пула.
 REG_DIRECT = env_bool("REG_DIRECT", True)
 REG_PROXY = os.environ.get("REG_PROXY", "").strip()      # напр. http://127.0.0.1:10809 (HTTP-инбаунд xray → каскад)
@@ -203,12 +210,46 @@ def register_account(routes: list[str]) -> dict:
             except RegError as e:
                 log.debug("PATCH warp_enabled: %s", e)
             addrs, peer = cfg["interface"]["addresses"], cfg["peers"][0]
-            return {"id": acc_id, "token": token, "private_key": priv,
-                    "peer_public_key": peer["public_key"],
-                    "v4": addrs["v4"], "v6": addrs.get("v6"), "registered_at": iso(), "route": route}
-        except (RegError, KeyError, ValueError) as e:
+            acc = {"id": acc_id, "token": token, "private_key": priv,
+                   "peer_public_key": peer["public_key"],
+                   "v4": addrs["v4"], "v6": addrs.get("v6"), "registered_at": iso(), "route": route}
+            return enroll_masque(acc, route) if ENGINE == "masque" else acc
+        except (RegError, KeyError, ValueError, CmdError) as e:
             errors.append(str(e))
     raise RegError("; ".join(errors))
+
+
+def ec_keypair() -> tuple[str, str]:
+    """P-256 для MASQUE: (SEC1 DER, PKIX DER) в base64 — так их ждут usque и API."""
+    pem = run(["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout"])
+    der = lambda args: base64.b64encode(subprocess.run(  # noqa: E731
+        ["openssl", "ec", "-outform", "DER", *args], input=pem.encode(), capture_output=True, check=True).stdout).decode()
+    return der([]), der(["-pubout"])
+
+
+def enroll_masque(acc: dict, route: str) -> dict:
+    """Перевести аккаунт на MASQUE: свой P-256 ключ вместо WireGuard. ID/токен/адреса те же."""
+    if DRY_RUN:
+        return {**acc, "type": "masque", "peer_public_key": "dry-pem", "endpoint_v4": "162.159.198.1"}
+    priv, pub = ec_keypair()
+    res = api("PATCH", f"reg/{acc['id']}", {"key": pub, "key_type": "secp256r1", "tunnel_type": "masque"},
+              token=acc["token"], route=route)
+    cfg = res["config"]
+    addrs, peer = cfg["interface"]["addresses"], cfg["peers"][0]
+    return {**acc, "type": "masque", "private_key": priv, "peer_public_key": peer["public_key"],
+            "v4": addrs["v4"], "v6": addrs.get("v6"),
+            "endpoint_v4": peer["endpoint"]["v4"].rsplit(":", 1)[0],
+            "endpoint_v6": peer["endpoint"].get("v6", "").rsplit(":", 1)[0].strip("[]")}
+
+
+def is_engine_account(acc: dict | None) -> bool:
+    """Аккаунт подходит движку: у MASQUE свой тип ключа, WG-аккаунт для него не годится, и наоборот."""
+    return bool(acc) and (acc.get("type") == "masque") == (ENGINE == "masque")
+
+
+def masque_endpoint(acc: dict | None = None) -> str:
+    ep = MASQUE_ENDPOINT or ("162.159.198.2" if MASQUE_HTTP2 else (acc or {}).get("endpoint_v4") or "162.159.198.1")
+    return f"{ep}:{MASQUE_PORT}"
 
 
 def unregister_account(acc: dict, routes: list[str]) -> None:
@@ -223,34 +264,69 @@ def unregister_account(acc: dict, routes: list[str]) -> None:
 
 
 # ---------------------------------------------------------------- интерфейсы
-_AWG_PROCS: dict[str, subprocess.Popen] = {}
+_PROCS: dict[str, subprocess.Popen] = {}
+_PROC_KEYS: dict[str, str] = {}  # masque: с каким приватным ключом запущен usque
 
 
-def create_iface(name: str) -> None:
-    """wg: ядерный интерфейс. awg: процесс amneziawg-go, который создаёт tun с этим именем."""
+def create_iface(name: str, acc: dict | None = None) -> None:
+    """wg: ядерный интерфейс. awg: процесс amneziawg-go, который создаёт tun с этим именем.
+    masque: процесс usque с конфигом аккаунта; без аккаунта — пустой tun-заглушка."""
     if ENGINE == "wg":
         run(["ip", "link", "add", "dev", name, "type", "wireguard"])
         return
-    if DRY_RUN:
-        log.debug("DRY: amneziawg-go -f %s", name)
+    if ENGINE == "masque" and not acc:
+        run(["ip", "tuntap", "add", "dev", name, "mode", "tun"])
         return
-    old = _AWG_PROCS.pop(name, None)
+    if ENGINE == "masque":
+        cmd = ["usque", "-c", str(masque_conf(name, acc)), "nativetun", "-n", name, "-I", "-m", str(MTU),
+               "-P", str(MASQUE_PORT), "--always-reconnect"]
+        if MASQUE_HTTP2:
+            cmd.append("--http2")
+        if MASQUE_SNI:
+            cmd += ["-s", MASQUE_SNI]
+    else:
+        cmd = ["amneziawg-go", "-f", name]
+    if DRY_RUN:
+        log.debug("DRY: %s", " ".join(cmd))
+        return
+    old = _PROCS.pop(name, None)
     if old and old.poll() is None:
         old.terminate()
-    _AWG_PROCS[name] = subprocess.Popen(["amneziawg-go", "-f", name],
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            old.wait(5)
+        except subprocess.TimeoutExpired:
+            old.kill()
+    _PROCS[name] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _PROC_KEYS[name] = (acc or {}).get("private_key", "")
     for _ in range(50):
         if ok(["ip", "link", "show", "dev", name]):
             return
         time.sleep(0.1)
-    raise CmdError(f"amneziawg-go не создал интерфейс {name}")
+    raise CmdError(f"{cmd[0]} не создал интерфейс {name}")
+
+
+def masque_conf(name: str, acc: dict) -> Path:
+    """Конфиг usque (читается при старте процесса). Лежит в RUN_DIR внутри контейнера, права 0600."""
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    conf = RUN_DIR / f"{name}.json"
+    ep = masque_endpoint(acc).rsplit(":", 1)[0]
+    conf.write_text(json.dumps({
+        "private_key": acc["private_key"], "endpoint_pub_key": acc["peer_public_key"],
+        "endpoint_v4": ep if not MASQUE_HTTP2 else acc.get("endpoint_v4", ""),
+        "endpoint_v6": acc.get("endpoint_v6", ""),
+        "endpoint_h2_v4": ep if MASQUE_HTTP2 else "", "endpoint_h2_v6": "",
+        "id": acc.get("id") or "", "access_token": acc.get("token") or "", "license": "",
+        "ipv4": acc["v4"], "ipv6": acc.get("v6") or "",
+    }))
+    conf.chmod(0o600)
+    return conf
 
 
 def iface_alive(name: str) -> bool:
     if not ok(["ip", "link", "show", "dev", name]):
         return False
-    if ENGINE == "awg":  # tun без процесса amneziawg-go — мёртвая оболочка
-        pr = _AWG_PROCS.get(name)
+    if USERSPACE:  # tun без своего процесса — мёртвая оболочка
+        pr = _PROCS.get(name)
         return bool(pr and pr.poll() is None)
     return True
 
@@ -309,6 +385,17 @@ class Tunnel:
         """Создать/обновить интерфейс, ключи, адреса и policy routing. Идемпотентно."""
         acc = self.account
         assert acc, "нет аккаунта"
+        if ENGINE == "masque":
+            if not iface_alive(self.name) or _PROC_KEYS.get(self.name) != acc["private_key"]:
+                run(["ip", "link", "del", "dev", self.name], check=False)
+                create_iface(self.name, acc)
+            self.endpoint = masque_endpoint(acc)
+            run(["ip", "-4", "addr", "flush", "dev", self.name])
+            run(["ip", "-4", "addr", "add", f"{acc['v4']}/32", "dev", self.name])
+            run(["ip", "link", "set", "dev", self.name, "mtu", str(MTU), "up"])
+            self.applied_at = now()
+            self._ensure_routes(set_v6_addr=True)
+            return
         if not iface_alive(self.name):
             run(["ip", "link", "del", "dev", self.name], check=False)
             create_iface(self.name)
@@ -410,6 +497,8 @@ class Tunnel:
         """Секунд с последнего handshake; None — handshake с этим ключом не было ни разу."""
         if DRY_RUN:
             return 5
+        if ENGINE == "masque":  # у usque нет счётчика handshake; битый аккаунт ловится по соседям
+            return 0
         out = run([WG_BIN, "show", self.name, "latest-handshakes"], check=False).split()
         if len(out) >= 2 and out[1].isdigit() and int(out[1]) > 0:
             return int(now()) - int(out[1])
@@ -488,6 +577,8 @@ class EndpointBook:
             self.good = dict(sorted(self.good.items(), key=lambda kv: kv[1], reverse=True)[:50])
 
     def size(self) -> int:
+        if ENGINE == "masque":  # эндпоинт у MASQUE один на всех — менять нечего
+            return 1
         return len(FIXED_ENDPOINTS) if FIXED_ENDPOINTS else 10**6
 
     def port_banned(self, port: str) -> bool:
@@ -499,7 +590,7 @@ class EndpointBook:
         return self.bad.get(ep, 0) > now() or self.port_banned(_port(ep))
 
     def mark_good(self, ep: str | None) -> None:
-        if ep:
+        if ep and ENGINE != "masque":
             self.good[ep] = now()
             self.bad.pop(ep, None)
 
@@ -625,6 +716,8 @@ class Pool:
 
     def pick_endpoint(self, t: Tunnel) -> str:
         """Эндпоинт для туннеля: не занятый соседями, не в бане, по возможности из другой /24."""
+        if ENGINE == "masque":
+            return masque_endpoint(t.account)
         others = [o.endpoint for o in self.tunnels if o is not t and o.account and o.endpoint]
         avoid = {_subnet(e) for e in others} | ({_subnet(t.endpoint)} if t.endpoint else set())  # и свою упавшую /24
         return self.book.pick(busy=set(others), avoid_subnets=avoid, after=t.endpoint)
@@ -633,6 +726,10 @@ class Pool:
     def bootstrap(self) -> None:
         check_host()
         for t in self.tunnels:
+            if t.account and not is_engine_account(t.account):
+                # сменили ENGINE между wg/awg и masque: ключ другого типа, нужен новый аккаунт
+                log.warning("%s: аккаунт не подходит движку %s — будет зарегистрирован новый", t.name, ENGINE)
+                t.account, t.endpoint = None, None
             if not t.account:
                 t.ensure_blackhole()  # пока аккаунта нет — интерфейс-заглушка, чтобы xray не утёк мимо WARP
                 t.last_action = now()
@@ -653,8 +750,8 @@ class Pool:
                     if self.new_account(t):
                         notify("account_created", t.name, "аккаунт создан (повторная попытка)", self)
                 continue
-            if ENGINE == "awg" and not DRY_RUN and not iface_alive(t.name):
-                log.warning("%s: процесс amneziawg-go умер — поднимаю заново", t.name)
+            if USERSPACE and not DRY_RUN and not iface_alive(t.name):
+                log.warning("%s: процесс туннеля умер — поднимаю заново", t.name)
                 t.apply()
             t.up = t.probe(loop_no)
             if t.up:
@@ -760,9 +857,9 @@ class Pool:
 def check_host() -> None:
     if DRY_RUN:
         return
-    if ENGINE == "awg":
+    if USERSPACE:
         if not Path("/dev/net/tun").exists():
-            sys.exit("ENGINE=awg: нет /dev/net/tun в контейнере — проверь devices в docker-compose.yml")
+            sys.exit(f"ENGINE={ENGINE}: нет /dev/net/tun в контейнере — проверь devices в docker-compose.yml")
     else:
         if not Path("/sys/module/wireguard").exists() and not ok(["ip", "link", "add", "wg-probe0", "type", "wireguard"]):
             sys.exit("нет модуля wireguard в ядре хоста: выполни на хосте `modprobe wireguard`")
@@ -813,13 +910,21 @@ def main() -> None:
         return
     if cmd == "import":
         # import N PRIVATE_KEY V4 [V6] — положить в туннель N готовый рабочий аккаунт (например, с другого хоста)
-        if len(sys.argv) < 5:
-            sys.exit("usage: import N PRIVATE_KEY V4 [V6]")
-        n, priv, v4 = int(sys.argv[2]), sys.argv[3], sys.argv[4].split("/")[0]
-        v6 = sys.argv[5].split("/")[0] if len(sys.argv) > 5 else None
-        t = pool.tunnels[n - 1]
-        t.account = {"id": None, "token": None, "private_key": priv, "peer_public_key": WARP_PEER_KEY,
-                     "v4": v4, "v6": v6, "registered_at": iso(), "route": "import"}
+        # import N CONFIG.json        — то же для masque: config.json от `usque register`
+        if len(sys.argv) == 4 and sys.argv[3].endswith(".json"):
+            c = json.loads(Path(sys.argv[3]).read_text())
+            acc = {"id": c.get("id"), "token": c.get("access_token"), "private_key": c["private_key"],
+                   "peer_public_key": c["endpoint_pub_key"], "v4": c["ipv4"], "v6": c.get("ipv6") or None,
+                   "endpoint_v4": c.get("endpoint_v4", ""), "endpoint_v6": c.get("endpoint_v6", ""),
+                   "type": "masque", "registered_at": iso(), "route": "import"}
+        elif len(sys.argv) >= 5:
+            v6 = sys.argv[5].split("/")[0] if len(sys.argv) > 5 else None
+            acc = {"id": None, "token": None, "private_key": sys.argv[3], "peer_public_key": WARP_PEER_KEY,
+                   "v4": sys.argv[4].split("/")[0], "v6": v6, "registered_at": iso(), "route": "import"}
+        else:
+            sys.exit("usage: import N PRIVATE_KEY V4 [V6]  |  import N USQUE_CONFIG.json")
+        t = pool.tunnels[int(sys.argv[2]) - 1]
+        t.account = acc
         t.last_reg = now()
         pool.save()
         log.info("%s: аккаунт импортирован; при следующем старте поднимется с ним", t.name)
@@ -834,6 +939,8 @@ def main() -> None:
     print(xray_snippets(), flush=True)
     eps = (f"auto ({len(AUTO_SUBNETS)} подсетей × {len(AUTO_PORTS)} портов)" if AUTO_ENDPOINTS
            else ", ".join(FIXED_ENDPOINTS))
+    if ENGINE == "masque":
+        eps = f"{masque_endpoint()} {'HTTP/2' if MASQUE_HTTP2 else 'HTTP/3'}, SNI {MASQUE_SNI or 'родной'}"
     regs = ",".join(["direct"] * REG_DIRECT + ["proxy"] * bool(REG_PROXY) + ["туннели"] * REG_VIA_TUNNEL) or "нет"
     log.info("старт: %d туннелей, движок %s, эндпоинты %s, регистрация: %s%s", TUNNELS, ENGINE, eps, regs,
              " [DRY_RUN]" if DRY_RUN else "")
