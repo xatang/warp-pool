@@ -52,10 +52,12 @@ WG_BIN = "awg" if ENGINE == "awg" else "wg"
 AWG_JC = env_int("AWG_JC", 4)
 AWG_JMIN = env_int("AWG_JMIN", 40)
 AWG_JMAX = env_int("AWG_JMAX", 70)
-MASQUE_HTTP2 = env_bool("MASQUE_HTTP2", True)                       # 0 — HTTP/3 (QUIC, UDP)
+# Транспорты MASQUE, между которыми пул раскладывает туннели и переключается, когда ТСПУ режет текущий:
+# h2 — HTTP/2 поверх TCP+TLS, h3 — HTTP/3 поверх QUIC. Запись: proto:port или proto:ip:port.
+MASQUE_TRANSPORTS = os.environ.get(
+    "MASQUE_TRANSPORTS", "h2:443,h2:4443,h2:500,h2:1701,h2:4500,h2:8095,h3:443,h3:8443").strip()
+MASQUE_DEFAULT_IP = {"h2": "162.159.198.2", "h3": "162.159.198.1"}
 MASQUE_SNI = os.environ.get("MASQUE_SNI", "www.cloudflare.com").strip()  # пусто — родной consumer-masque.*
-MASQUE_ENDPOINT = os.environ.get("MASQUE_ENDPOINT", "").strip()     # пусто — 162.159.198.2 (h2) / из аккаунта (h3)
-MASQUE_PORT = env_int("MASQUE_PORT", 443)
 # Регистрация аккаунтов: напрямую, через HTTP-прокси и/или через уже живой туннель пула.
 REG_DIRECT = env_bool("REG_DIRECT", True)
 REG_PROXY = os.environ.get("REG_PROXY", "").strip()      # напр. http://127.0.0.1:10809 (HTTP-инбаунд xray → каскад)
@@ -247,9 +249,24 @@ def is_engine_account(acc: dict | None) -> bool:
     return bool(acc) and (acc.get("type") == "masque") == (ENGINE == "masque")
 
 
-def masque_endpoint(acc: dict | None = None) -> str:
-    ep = MASQUE_ENDPOINT or ("162.159.198.2" if MASQUE_HTTP2 else (acc or {}).get("endpoint_v4") or "162.159.198.1")
-    return f"{ep}:{MASQUE_PORT}"
+def _masque_eps() -> list[str]:
+    """MASQUE_TRANSPORTS → эндпоинты вида h2:162.159.198.2:4443 (живут в той же EndpointBook, что и WG)."""
+    eps = []
+    for item in filter(None, (x.strip() for x in MASQUE_TRANSPORTS.split(","))):
+        parts = item.split(":")
+        if parts[0] not in MASQUE_DEFAULT_IP or len(parts) not in (2, 3):
+            sys.exit(f"MASQUE_TRANSPORTS: не понял «{item}», нужно h2:PORT, h3:PORT или proto:IP:PORT")
+        proto, ip, port = parts[0], (parts[1] if len(parts) == 3 else MASQUE_DEFAULT_IP[parts[0]]), parts[-1]
+        eps.append(f"{proto}:{ip}:{int(port)}")
+    return eps or sys.exit("MASQUE_TRANSPORTS пуст")
+
+
+MASQUE_EPS = _masque_eps() if ENGINE == "masque" else []
+
+
+def masque_parse(ep: str) -> tuple[str, str, str]:
+    proto, ip, port = ep.split(":")
+    return proto, ip, port
 
 
 def unregister_account(acc: dict, routes: list[str]) -> None:
@@ -265,12 +282,16 @@ def unregister_account(acc: dict, routes: list[str]) -> None:
 
 # ---------------------------------------------------------------- интерфейсы
 _PROCS: dict[str, subprocess.Popen] = {}
-_PROC_KEYS: dict[str, str] = {}  # masque: с каким приватным ключом запущен usque
+_PROC_KEYS: dict[str, str] = {}  # masque: с каким ключом и эндпоинтом запущен usque
 
 
-def create_iface(name: str, acc: dict | None = None) -> None:
+def masque_proc_key(acc: dict, ep: str) -> str:
+    return f"{acc['private_key']}|{ep}"
+
+
+def create_iface(name: str, acc: dict | None = None, ep: str | None = None) -> None:
     """wg: ядерный интерфейс. awg: процесс amneziawg-go, который создаёт tun с этим именем.
-    masque: процесс usque с конфигом аккаунта; без аккаунта — пустой tun-заглушка."""
+    masque: процесс usque с конфигом аккаунта и транспортом ep; без аккаунта — пустой tun-заглушка."""
     if ENGINE == "wg":
         run(["ip", "link", "add", "dev", name, "type", "wireguard"])
         return
@@ -278,9 +299,10 @@ def create_iface(name: str, acc: dict | None = None) -> None:
         run(["ip", "tuntap", "add", "dev", name, "mode", "tun"])
         return
     if ENGINE == "masque":
-        cmd = ["usque", "-c", str(masque_conf(name, acc)), "nativetun", "-n", name, "-I", "-m", str(MTU),
-               "-P", str(MASQUE_PORT), "--always-reconnect"]
-        if MASQUE_HTTP2:
+        proto, _, port = masque_parse(ep)
+        cmd = ["usque", "-c", str(masque_conf(name, acc, ep)), "nativetun", "-n", name, "-I", "-m", str(MTU),
+               "-P", port, "--always-reconnect"]
+        if proto == "h2":
             cmd.append("--http2")
         if MASQUE_SNI:
             cmd += ["-s", MASQUE_SNI]
@@ -297,7 +319,7 @@ def create_iface(name: str, acc: dict | None = None) -> None:
         except subprocess.TimeoutExpired:
             old.kill()
     _PROCS[name] = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    _PROC_KEYS[name] = (acc or {}).get("private_key", "")
+    _PROC_KEYS[name] = masque_proc_key(acc, ep) if ENGINE == "masque" else ""
     for _ in range(50):
         if ok(["ip", "link", "show", "dev", name]):
             return
@@ -305,16 +327,16 @@ def create_iface(name: str, acc: dict | None = None) -> None:
     raise CmdError(f"{cmd[0]} не создал интерфейс {name}")
 
 
-def masque_conf(name: str, acc: dict) -> Path:
+def masque_conf(name: str, acc: dict, ep: str) -> Path:
     """Конфиг usque (читается при старте процесса). Лежит в RUN_DIR внутри контейнера, права 0600."""
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     conf = RUN_DIR / f"{name}.json"
-    ep = masque_endpoint(acc).rsplit(":", 1)[0]
+    proto, ip, _ = masque_parse(ep)
     conf.write_text(json.dumps({
         "private_key": acc["private_key"], "endpoint_pub_key": acc["peer_public_key"],
-        "endpoint_v4": ep if not MASQUE_HTTP2 else acc.get("endpoint_v4", ""),
+        "endpoint_v4": ip if proto == "h3" else acc.get("endpoint_v4", ""),
         "endpoint_v6": acc.get("endpoint_v6", ""),
-        "endpoint_h2_v4": ep if MASQUE_HTTP2 else "", "endpoint_h2_v6": "",
+        "endpoint_h2_v4": ip if proto == "h2" else "", "endpoint_h2_v6": "",
         "id": acc.get("id") or "", "access_token": acc.get("token") or "", "license": "",
         "ipv4": acc["v4"], "ipv6": acc.get("v6") or "",
     }))
@@ -386,10 +408,11 @@ class Tunnel:
         acc = self.account
         assert acc, "нет аккаунта"
         if ENGINE == "masque":
-            if not iface_alive(self.name) or _PROC_KEYS.get(self.name) != acc["private_key"]:
+            if self.endpoint not in MASQUE_EPS:
+                self.endpoint = MASQUE_EPS[(self.n - 1) % len(MASQUE_EPS)]
+            if not iface_alive(self.name) or _PROC_KEYS.get(self.name) != masque_proc_key(acc, self.endpoint):
                 run(["ip", "link", "del", "dev", self.name], check=False)
-                create_iface(self.name, acc)
-            self.endpoint = masque_endpoint(acc)
+                create_iface(self.name, acc, self.endpoint)
             run(["ip", "-4", "addr", "flush", "dev", self.name])
             run(["ip", "-4", "addr", "add", f"{acc['v4']}/32", "dev", self.name])
             run(["ip", "link", "set", "dev", self.name, "mtu", str(MTU), "up"])
@@ -485,6 +508,9 @@ class Tunnel:
             self._ensure_rule("-6")
 
     def set_endpoint(self) -> None:
+        if ENGINE == "masque":  # транспорт задаётся при запуске usque — перезапускаем процесс
+            self.apply()
+            return
         run([WG_BIN, "set", self.name, "peer", self.account["peer_public_key"], "endpoint", self.endpoint])
 
     def teardown(self) -> None:
@@ -577,20 +603,20 @@ class EndpointBook:
             self.good = dict(sorted(self.good.items(), key=lambda kv: kv[1], reverse=True)[:50])
 
     def size(self) -> int:
-        if ENGINE == "masque":  # эндпоинт у MASQUE один на всех — менять нечего
-            return 1
+        if ENGINE == "masque":
+            return len(MASQUE_EPS)
         return len(FIXED_ENDPOINTS) if FIXED_ENDPOINTS else 10**6
 
     def port_banned(self, port: str) -> bool:
         t = now()
         ips = {e.rsplit(":", 1)[0] for e, u in self.bad.items() if u > t and _port(e) == port}
-        return AUTO_ENDPOINTS and len(ips) >= BAD_PORT_AFTER
+        return AUTO_ENDPOINTS and ENGINE != "masque" and len(ips) >= BAD_PORT_AFTER
 
     def is_bad(self, ep: str) -> bool:
         return self.bad.get(ep, 0) > now() or self.port_banned(_port(ep))
 
     def mark_good(self, ep: str | None) -> None:
-        if ep and ENGINE != "masque":
+        if ep:
             self.good[ep] = now()
             self.bad.pop(ep, None)
 
@@ -604,6 +630,16 @@ class EndpointBook:
 
     def pick(self, busy: set, avoid_subnets: set, after: str | None) -> str:
         ok = lambda e: e not in busy and not self.is_bad(e)  # noqa: E731
+        if ENGINE == "masque":
+            # транспортов мало: сначала свободный и не в бане, потом не в бане, потом любой — по кругу
+            lst = MASQUE_EPS
+            start = lst.index(after) + 1 if after in lst else 0
+            ring = [lst[(start + i) % len(lst)] for i in range(len(lst))]
+            for cond in (ok, lambda e: not self.is_bad(e)):
+                for e in ring:
+                    if cond(e):
+                        return e
+            return ring[0]
         if FIXED_ENDPOINTS:
             lst = FIXED_ENDPOINTS
             start = lst.index(after) + 1 if after in lst else 0
@@ -684,7 +720,8 @@ class Pool:
             return False
         if not t.account:  # новый туннель — сразу на незанятый эндпоинт
             busy = {o.endpoint for o in self.tunnels if o is not t and o.account}
-            if not t.endpoint or t.endpoint in busy or self.book.is_bad(t.endpoint):
+            if (not t.endpoint or t.endpoint in busy or self.book.is_bad(t.endpoint)
+                    or (ENGINE == "masque" and t.endpoint not in MASQUE_EPS)):
                 t.endpoint = self.pick_endpoint(t)
         routes = self.reg_routes(exclude=t)
         if not routes:  # ждём, пока поднимется хоть один туннель — бюджет не тратим
@@ -716,8 +753,9 @@ class Pool:
 
     def pick_endpoint(self, t: Tunnel) -> str:
         """Эндпоинт для туннеля: не занятый соседями, не в бане, по возможности из другой /24."""
-        if ENGINE == "masque":
-            return masque_endpoint(t.account)
+        if ENGINE == "masque":  # разложить туннели по разным транспортам: один фильтр не кладёт весь пул
+            others = {o.endpoint for o in self.tunnels if o is not t and o.account and o.endpoint}
+            return self.book.pick(busy=others, avoid_subnets=set(), after=t.endpoint)
         others = [o.endpoint for o in self.tunnels if o is not t and o.account and o.endpoint]
         avoid = {_subnet(e) for e in others} | ({_subnet(t.endpoint)} if t.endpoint else set())  # и свою упавшую /24
         return self.book.pick(busy=set(others), avoid_subnets=avoid, after=t.endpoint)
@@ -736,7 +774,7 @@ class Pool:
                 if self.new_account(t):
                     notify("account_created", t.name, f"аккаунт создан, эндпоинт {t.endpoint}", self)
                 continue
-            if not t.endpoint:
+            if not t.endpoint or (ENGINE == "masque" and t.endpoint not in MASQUE_EPS):
                 t.endpoint = self.pick_endpoint(t)
             t.apply()
             log.info("%s: поднят из state (эндпоинт %s)", t.name, t.endpoint)
@@ -770,9 +808,18 @@ class Pool:
         live = [t for t in self.tunnels if t.account]
         if live and len(failing) == len(live):
             # Все сразу — проблема хоста/сети, а не аккаунтов. Не жжём регистрации.
+            # У masque это обычно ТСПУ закрыл транспорт — транспорты перебираем (это дёшево), аккаунты не трогаем.
+            if ENGINE == "masque":
+                for t in failing:
+                    if now() - t.last_action >= ACTION_COOLDOWN:
+                        t.last_action = now()
+                        self.switch_endpoint(t)
+                        t.endpoint_changes = 0  # массовое падение не в счёт попыток перед новой регистрацией
             if now() - self.all_down_notified > 3600:
                 self.all_down_notified = now()
-                notify("all_down", None, "лежат все туннели сразу — похоже на сеть хоста, ротацию не делаю", self)
+                notify("all_down", None, "лежат все туннели сразу — похоже на сеть хоста, "
+                       + ("перебираю транспорты, аккаунты не трогаю" if ENGINE == "masque" else "ротацию не делаю"),
+                       self)
             return
         self.all_down_notified = 0.0
 
@@ -781,9 +828,11 @@ class Pool:
                 continue
             t.last_action = now()
             # Признаки, что виноват аккаунт, а не эндпоинт: смена эндпоинта не поможет.
+            # У masque не применяем: ТСПУ замораживает соединения по одному, сосед на том же транспорте
+            # может быть жив просто потому, что его соединение ещё не тронули. Сначала — смена транспорта.
             no_handshake = t.handshake_age() is None and now() - t.applied_at > DEAD_ACCOUNT_AFTER
             ep_ok_elsewhere = any(o is not t and o.up and o.endpoint == t.endpoint for o in self.tunnels)
-            if no_handshake or ep_ok_elsewhere:
+            if ENGINE != "masque" and (no_handshake or ep_ok_elsewhere):
                 why = "ни одного handshake с этим ключом" if no_handshake else f"эндпоинт {t.endpoint} работает у соседа"
                 if self.new_account(t):
                     t.rotations += 1
@@ -794,15 +843,9 @@ class Pool:
                     t.blocked_notified = now()
                     notify("rotation_blocked", t.name, f"аккаунт битый ({why}), но лимит регистраций исчерпан", self)
                 continue
-            if t.endpoint_changes < ENDPOINT_TRIES and self.book.size() > 1:
-                old = t.endpoint
-                self.book.mark_bad(old)
-                t.endpoint = self.pick_endpoint(t)
-                t.endpoint_changes += 1
-                t.set_endpoint()
-                t.fails = 0
-                self.save()
-                notify("endpoint_changed", t.name, f"{old} → {t.endpoint}", self)
+            tries = len(MASQUE_EPS) if ENGINE == "masque" else ENDPOINT_TRIES
+            if t.endpoint_changes < tries and self.book.size() > 1:
+                self.switch_endpoint(t)
             elif now() - t.last_reg >= REG_COOLDOWN and self.new_account(t):
                 t.rotations += 1
                 t.fails, t.endpoint_changes = 0, 0
@@ -813,6 +856,16 @@ class Pool:
                 why = ("лимит регистраций исчерпан" if self.reg_budget_left() <= 0
                        else f"прошлая регистрация < {REG_COOLDOWN // 60} мин назад")
                 notify("rotation_blocked", t.name, f"туннель лежит, ротация отложена: {why}", self)
+
+    def switch_endpoint(self, t: Tunnel) -> None:
+        old = t.endpoint
+        self.book.mark_bad(old)
+        t.endpoint = self.pick_endpoint(t)
+        t.endpoint_changes += 1
+        t.set_endpoint()
+        t.fails = 0
+        self.save()
+        notify("endpoint_changed", t.name, f"{old} → {t.endpoint}", self)
 
     def log_summary(self) -> None:
         """Строка состояния: при первом цикле, при смене набора живых туннелей и раз в SUMMARY_INTERVAL."""
@@ -940,7 +993,7 @@ def main() -> None:
     eps = (f"auto ({len(AUTO_SUBNETS)} подсетей × {len(AUTO_PORTS)} портов)" if AUTO_ENDPOINTS
            else ", ".join(FIXED_ENDPOINTS))
     if ENGINE == "masque":
-        eps = f"{masque_endpoint()} {'HTTP/2' if MASQUE_HTTP2 else 'HTTP/3'}, SNI {MASQUE_SNI or 'родной'}"
+        eps = f"{len(MASQUE_EPS)} транспортов MASQUE ({MASQUE_TRANSPORTS}), SNI {MASQUE_SNI or 'родной'}"
     regs = ",".join(["direct"] * REG_DIRECT + ["proxy"] * bool(REG_PROXY) + ["туннели"] * REG_VIA_TUNNEL) or "нет"
     log.info("старт: %d туннелей, движок %s, эндпоинты %s, регистрация: %s%s", TUNNELS, ENGINE, eps, regs,
              " [DRY_RUN]" if DRY_RUN else "")

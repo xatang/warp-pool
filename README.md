@@ -42,6 +42,9 @@
 3. Не помогло — **новый аккаунт** (не чаще раза в 10 мин на туннель, не больше 6 регистраций
    в час на хост).
 
+У `masque` шаг 1 пропускается, эндпоинт — это транспорт (`h2:…:4443`), и перебираются все
+транспорты из `MASQUE_TRANSPORTS`, прежде чем дело дойдёт до нового аккаунта.
+
 ## Требования
 
 - Linux-хост с Docker и Docker Compose, KVM (не OpenVZ/LXC).
@@ -119,10 +122,16 @@ AmneziaWG (мусор есть только до handshake, пакеты дан�
 Проверить: `docker exec warp-pool awg show` — `latest handshake` старше пары минут и
 `received` не растёт.
 
-TCP до Cloudflare при этом живёт, а MASQUE-соединение с родным SNI
-`consumer-masque.cloudflareclient.com` замораживается после первого ответа. Поэтому `masque`
-по умолчанию ходит HTTP/2 (TCP/443) на `162.159.198.2` с SNI `www.cloudflare.com` — usque
-проверяет сервер по закреплённому ключу, а не по сертификату, так что подмена SNI безопасна.
+MASQUE с родным SNI `consumer-masque.cloudflareclient.com` замораживается после первого
+ответа, поэтому `masque` ходит с SNI `www.cloudflare.com` — usque проверяет сервер по
+закреплённому ключу, а не по сертификату, так что подмена SNI безопасна.
+
+Правила ТСПУ меняются: через неделю работы HTTP/2 на 443 начал замораживаться при любом SNI,
+зато ожили HTTP/2 на 4443/500/1701/4500/8095 и QUIC на 443/8443. Поэтому транспортов несколько
+(`MASQUE_TRANSPORTS`): туннели раскладываются по разным, лежащий туннель переключается на
+следующий, упавший транспорт банится на `BAD_ENDPOINT_TTL`. Если легли все туннели сразу,
+транспорты всё равно перебираются, но аккаунты не перерегистрируются. Новый аккаунт — только
+когда не помог ни один транспорт.
 
 1. В `.env`: `ENGINE=masque`, `REG_DIRECT=0`.
 2. Засеять первый туннель аккаунтом, зарегистрированным там, где API доступен:
@@ -161,9 +170,8 @@ docker compose run --rm warp-pool down                      # снять инт�
 | Переменная | По умолч. | |
 |---|---|---|
 | `ENGINE` | `wg` | `wg` — ядерный WireGuard, `awg` — AmneziaWG, `masque` — MASQUE (usque) |
-| `MASQUE_HTTP2` | 1 | `masque`: HTTP/2 по TCP; 0 — HTTP/3 по QUIC (UDP) |
+| `MASQUE_TRANSPORTS` | `h2:443,h2:4443,h2:500,h2:1701,h2:4500,h2:8095,h3:443,h3:8443` | `masque`: транспорты `proto:port` / `proto:ip:port` (h2 → `162.159.198.2`, h3 → `162.159.198.1`) |
 | `MASQUE_SNI` | `www.cloudflare.com` | `masque`: SNI; пусто — родной `consumer-masque.cloudflareclient.com` |
-| `MASQUE_ENDPOINT` / `MASQUE_PORT` | — / 443 | `masque`: адрес сервера; пусто — `162.159.198.2` (h2) или из аккаунта (h3) |
 | `WARP_TUNNELS` | 3 | сколько туннелей |
 | `ENDPOINTS` | `auto` | `auto` или список `ip:port,ip:port,...` |
 | `AUTO_SUBNETS` / `AUTO_PORTS` | подсети WARP / 14 портов | откуда брать адреса в `auto` |
